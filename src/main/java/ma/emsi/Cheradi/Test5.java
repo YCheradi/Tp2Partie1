@@ -1,8 +1,9 @@
 package ma.emsi.Cheradi;
 
 import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
 import dev.langchain4j.data.document.DocumentSplitter;
+import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
+import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
@@ -32,9 +33,16 @@ public class Test5 {
 
     public static void main(String[] args) {
 
+        System.out.println("▶ Démarrage Test5…");
+
+        // 0) Clé API (fallback GEMINI_KEY)
         String apiKey = System.getenv("GEMINI_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
-            System.err.println("⚠️  Variable d'environnement GEMINI_API_KEY manquante.");
+            apiKey = System.getenv("GEMINI_KEY");
+        }
+        if (apiKey == null || apiKey.isBlank()) {
+            System.out.println("❌ Variable d'environnement GEMINI_API_KEY (ou GEMINI_KEY) manquante.");
+            System.out.println("   IntelliJ > Run/Debug Configurations > Environment variables");
             return;
         }
 
@@ -45,31 +53,53 @@ public class Test5 {
                 .temperature(0.2)
                 .responseFormat(ResponseFormat.TEXT)
                 .timeout(Duration.ofSeconds(90))
+                .logRequestsAndResponses(false)
                 .build();
 
-        // 2) Modèle d'embeddings
+        // 2) Modèle d'embeddings (avec timeout)
         EmbeddingModel embeddingModel = GoogleAiEmbeddingModel.builder()
                 .apiKey(apiKey)
                 .modelName("text-embedding-004")
+                .timeout(Duration.ofSeconds(120))
                 .build();
 
-        // 3) Charger le PDF
-        String nomPdf = "support-ml.pdf"; // mets ici le nom réel de ton PDF
-        Document document = FileSystemDocumentLoader.loadDocument(nomPdf);
+        // 3) Charger le PDF avec PARSEUR PDFBOX
+        String nomPdf = "support-ml.pdf"; // adapte si besoin
+        System.out.println("📂 Répertoire de travail: " + java.nio.file.Paths.get("").toAbsolutePath());
+        java.nio.file.Path pdfPath = java.nio.file.Paths.get(nomPdf);
+        if (!java.nio.file.Files.exists(pdfPath)) {
+            System.out.println("❌ PDF introuvable: " + pdfPath.toAbsolutePath());
+            return;
+        }
+        System.out.println("✅ PDF trouvé: " + pdfPath.toAbsolutePath());
+
+        Document document = FileSystemDocumentLoader.loadDocument(
+                nomPdf,
+                new ApachePdfBoxDocumentParser() // <<< IMPORTANT
+        );
 
         // 4) Base vectorielle en mémoire
         EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
 
-        // 5) Splitter récursif
-        DocumentSplitter splitter = DocumentSplitters.recursive(800, 100);
+        // 5) Splitter (moins de chunks => moins d’appels réseau)
+        DocumentSplitter splitter = DocumentSplitters.recursive(3000, 200);
 
-        // 6) Ingestion (chunks -> embeddings -> store)
+        // 6) Ingestion avec logs
         EmbeddingStoreIngestor ingestor = EmbeddingStoreIngestor.builder()
                 .embeddingModel(embeddingModel)
                 .documentSplitter(splitter)
                 .embeddingStore(embeddingStore)
                 .build();
-        ingestor.ingest(document);
+
+        System.out.println("⏳ Ingestion en cours (génération des embeddings) …");
+        try {
+            ingestor.ingest(document);
+            System.out.println("✅ Ingestion terminée.");
+        } catch (Exception e) {
+            System.out.println("❌ Erreur pendant l’ingestion : " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
 
         // 7) Retriever top-k
         ContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
@@ -85,16 +115,16 @@ public class Test5 {
                 .contentRetriever(retriever)
                 .build();
 
-        // 9) Conversation multi-questions
+        // 9) Conversation
         conversationAvec(assistant, retriever);
     }
 
-    // Boucle interactive
     private static void conversationAvec(Assistant assistant, ContentRetriever retriever) {
+        System.out.println("💬 Prêt. Posez votre question (ou 'fin' pour quitter) :");
         try (Scanner scanner = new Scanner(System.in)) {
             while (true) {
                 System.out.println("==================================================");
-                System.out.println("Posez votre question (ou 'fin' pour quitter) : ");
+                System.out.print("Votre question > ");
                 String question = scanner.nextLine();
                 System.out.println("==================================================");
 
@@ -104,22 +134,32 @@ public class Test5 {
                     break;
                 }
 
-                // Afficher les segments RAG récupérés (sans introspection avancée des métadonnées)
+                // Afficher les segments RAG récupérés
                 try {
                     List<Content> retrieved = retriever.retrieve(Query.from(question));
                     System.out.println("---- Passages récupérés (RAG) ----");
-                    for (Content c : retrieved) {
-                        TextSegment s = c.textSegment();
-                        // Affiche un extrait + métadonnées brutes (toString), sans dépendre d'API non dispo
-                        System.out.println("- META: " + String.valueOf(s.metadata()));
-                        System.out.println("  TEXTE: " + snip(s.text(), 220));
+                    if (retrieved == null || retrieved.isEmpty()) {
+                        System.out.println("(aucun passage pertinent trouvé)");
+                    } else {
+                        for (Content c : retrieved) {
+                            TextSegment s = c.textSegment();
+                            String meta = (s != null && s.metadata() != null) ? s.metadata().toString() : "{}";
+                            String txt = (s != null) ? s.text() : "";
+                            System.out.println("- META: " + meta);
+                            System.out.println("  TEXTE: " + snip(txt, 220));
+                        }
                     }
                     System.out.println("----------------------------------");
                 } catch (Exception e) {
                     System.out.println("(Info) Impossible d’afficher les passages RAG : " + e.getMessage());
                 }
 
-                String reponse = assistant.repond(question);
+                String reponse;
+                try {
+                    reponse = assistant.repond(question);
+                } catch (Exception e) {
+                    reponse = "Erreur pendant l'appel au modèle: " + e.getMessage();
+                }
                 System.out.println("Assistant : " + reponse);
             }
         }
